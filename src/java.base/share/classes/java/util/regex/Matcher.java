@@ -26,6 +26,7 @@
 package java.util.regex;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.ConcurrentModificationException;
 import java.util.Iterator;
 import java.util.Map;
@@ -185,6 +186,23 @@ public final class Matcher implements MatchResult {
      * during a match.
      */
     IntHashSet[] localsPos;
+
+    /**
+     * Growable stack used by GroupCurly nodes to save the positions of the
+     * capture groups nested inside the body of the quantified group, before
+     * each repetition of the body is attempted. When a repetition that
+     * matched is undone by backtracking, the saved positions are restored,
+     * so that after a successful match the nested groups reflect only the
+     * repetitions that are part of the match. The nodes themselves are
+     * stateless, so they rely on this field to hold state during a match.
+     */
+    int[] groupPosStack;
+
+    /**
+     * The current top of {@code groupPosStack}, that is, the index in the
+     * stack where the next saved group positions are written.
+     */
+    int groupPosTop;
 
     /**
      * Boolean indicating whether or not more input could change
@@ -1737,6 +1755,96 @@ public final class Matcher implements MatchResult {
     }
 
     /**
+     * Saves the positions currently held by the {@code n} capture group
+     * slots {@code groups[fromSlot]}, ..., {@code groups[fromSlot + n - 1]}
+     * on the group positions stack.
+     *
+     * Called by GroupCurly nodes before attempting a repetition of the body
+     * of the quantified group, so that the positions of the capture groups
+     * nested in the body can be restored if the repetition is undone by
+     * backtracking.
+     */
+    void saveGroupPos(int fromSlot, int n) {
+        int top = groupPosTop;
+        int[] stack = groupPosStack;
+        if (stack == null || stack.length - top < n) {
+            stack = growGroupPosStack(top, n);
+        }
+        if (n == 2) {   // a single nested capture group: the common case
+            stack[top] = groups[fromSlot];
+            stack[top + 1] = groups[fromSlot + 1];
+        } else {
+            System.arraycopy(groups, fromSlot, stack, top, n);
+        }
+        groupPosTop = top + n;
+    }
+
+    private int[] growGroupPosStack(int top, int n) {
+        int[] stack = groupPosStack;
+        int newLen = stack == null ? 64 : stack.length;
+        while (newLen - top < n) {
+            if (newLen >= (1 << 30)) {
+                newLen = Integer.MAX_VALUE;
+                if (newLen - top < n)
+                    throw new OutOfMemoryError("Group positions stack");
+            } else {
+                newLen <<= 1;
+            }
+        }
+        return groupPosStack = (stack == null)
+                ? new int[newLen]
+                : Arrays.copyOf(stack, newLen);
+    }
+
+    /**
+     * Drops the most recently saved {@code n} group positions without
+     * restoring them. Called when the attempt of a repetition failed and
+     * the unwinding of the nodes inside the body has already restored the
+     * group positions.
+     */
+    void dropGroupPos(int n) {
+        groupPosTop -= n;
+    }
+
+    /**
+     * Pops the most recently saved {@code n} group positions and restores
+     * them into {@code groups[fromSlot]}, ...,
+     * {@code groups[fromSlot + n - 1]}. Called when a repetition that
+     * matched is undone by backtracking.
+     */
+    void restoreGroupPos(int fromSlot, int n) {
+        groupPosTop -= n;
+        int top = groupPosTop;
+        int[] stack = groupPosStack;
+        if (n == 2) {   // a single nested capture group: the common case
+            groups[fromSlot] = stack[top];
+            groups[fromSlot + 1] = stack[top + 1];
+        } else {
+            System.arraycopy(stack, top, groups, fromSlot, n);
+        }
+    }
+
+    /**
+     * Restores the group positions that were saved at the stack position
+     * {@code base} and drops all the positions saved above it. Called when
+     * the quantified group fails after some repetitions matched: the group
+     * positions must then be left as they were before the first repetition
+     * was attempted.
+     */
+    void restoreGroupPosBase(int base, int fromSlot, int n) {
+        if (groupPosTop > base) {
+            if (n == 2) {   // a single nested capture group: the common case
+                int[] stack = groupPosStack;
+                groups[fromSlot] = stack[base];
+                groups[fromSlot + 1] = stack[base + 1];
+            } else {
+                System.arraycopy(groupPosStack, base, groups, fromSlot, n);
+            }
+        }
+        groupPosTop = base;
+    }
+
+    /**
      * Initiates a search to find a Pattern within the given bounds.
      * The groups are filled with default values and the match of the root
      * of the state machine is called. The state machine will hold the state
@@ -1761,6 +1869,7 @@ public final class Matcher implements MatchResult {
             if (localsPos[i] != null)
                 localsPos[i].clear();
         }
+        groupPosTop = 0;
         acceptMode = NOANCHOR;
         boolean result = parentPattern.root.match(this, from, text);
         if (!result)
@@ -1788,6 +1897,7 @@ public final class Matcher implements MatchResult {
             if (localsPos[i] != null)
                 localsPos[i].clear();
         }
+        groupPosTop = 0;
         acceptMode = anchor;
         boolean result = parentPattern.matchRoot.match(this, from, text);
         if (!result)

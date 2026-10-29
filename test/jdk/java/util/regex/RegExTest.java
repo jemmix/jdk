@@ -36,7 +36,7 @@
  * 6345469 6988218 6693451 7006761 8140212 8143282 8158482 8176029 8184706
  * 8194667 8197462 8184692 8221431 8224789 8228352 8230829 8236034 8235812
  * 8216332 8214245 8237599 8241055 8247546 8258259 8037397 8269753 8276694
- * 8280403 8264160 8281315 8305107 8393247
+ * 8280403 8264160 8281315 8305107 8393247 8381696
  * @library /test/lib
  * @library /lib/testlibrary/java/lang
  * @build jdk.test.lib.RandomFactory
@@ -4730,6 +4730,121 @@ public class RegExTest {
         String line = "\ud83d\udc95\ud83d\udc95\ud83d\udc95";
         var pattern2 = Pattern.compile("(?i)(.)\\1{2,}");
         assertTrue(pattern2.matcher(line).find());
+    }
+
+    // This test is for 8381696
+    //
+    // A quantified group whose body contains capture groups must not leak
+    // the positions of those groups from repetitions, or whole match
+    // attempts, that were undone by backtracking: after a successful
+    // match, a group must report the position of its last repetition that
+    // is part of the match, or null if it never matched.  Wrapping a
+    // quantified capture group in a non-capturing group must not change
+    // its capture semantics, and neither must the quantifier type
+    // (greedy, reluctant or possessive).
+    @Test
+    public static void groupPositionsOnBacktrackTest() {
+        // Cases where the group never participates in the accepted match:
+        // group(1) must be null.  The match is empty at the end of the
+        // input, reached only after failed attempts at earlier positions.
+        String[] nullGroup = {
+            "(?:(a))*$", "(a)*$", "(?:(a)){0,}$", "(?:(a)){0,3}$",
+            "(?:(a))?$", "(?:(a)){0,1}$", "(?:(a))*?$", "(?:(a))*+$",
+            "(a)*+$", "(?:(?<n>a))*$", "(?:(?:(a)))*$",
+            "(?:(a))*\\z", "(?:(a))++c|",
+        };
+        for (String p : nullGroup) {
+            checkGroups(p, "aaab", "", null);
+            if (!p.contains("(?<"))
+                checkGroups(toSupplementaries(p), toSupplementaries("aaab"),
+                        "", null);
+        }
+        // The outer group of ((a)) stays null as well
+        checkGroups("((a))*$", "aaab", "", null, null);
+        checkGroups("((a))*+$", "aaab", "", null, null);
+        checkGroups(toSupplementaries("((a))*$"),
+                toSupplementaries("aaab"), "", null, null);
+
+        // The group participates: its last participating repetition
+        // must be reported.
+        checkGroups("(?:(a))*b", "aab", "aab", "a");
+        checkGroups("(?:(a))*c", "aaac", "aaac", "a");
+        checkGroups("(?:(a)){2,}b", "aab", "aab", "a");
+        checkGroups("(?:(a))++b", "aab", "aab", "a");
+        checkGroups("(?:(a))*?(b)$", "ab", "ab", "a", "b");
+        checkGroups("(?:(a)|(b))*", "ab", "ab", "a", "b");
+        checkGroups("(?:(a)(b))*$", "ab", "ab", "a", "b");
+        checkGroups("(?:a(b))*+", "abab", "abab", "b");
+        checkGroups("(?:(a){0,2})*", "aaa", "aaa", "a");
+        checkGroups("(?:(a))*+", "aaab", "aaa", "a");
+        checkGroups("(?:(a)|b)*+$", "aaab", "aaab", "a");
+
+        // A zero-length repetition does participate: the group is set to
+        // the empty match, not to null
+        checkGroups("(?:(a?))*", "b", "", "");
+        checkGroups("(?:(a?))*$", "b", "", "");
+
+        // A failed first alternative must not leak into the second
+        checkGroups("(?:(a))*z|(b)", "aaab", "b", null, "b");
+        checkGroups("(?:(a))*z|.", "aaab", "a", null);
+
+        // Repeated find() on the same matcher; every match stands alone
+        Matcher m = Pattern.compile("(?:(a))*").matcher("aXaX");
+        String[][] finds = {
+            {"a", "a"}, {""}, {"a", "a"}, {""}, {""},
+        };
+        int i = 0;
+        while (m.find()) {
+            assertEquals(m.group(), finds[i][0], "match " + i);
+            assertEquals(m.group(1),
+                    finds[i].length > 1 ? finds[i][1] : null, "group 1, match " + i);
+            i++;
+        }
+        assertEquals(i, finds.length);
+
+        // Group values must be correct in MatchResult snapshots
+        MatchResult mr = Pattern.compile("(?:(a))*c").matcher("aaac")
+                .results().findFirst().orElseThrow();
+        assertEquals(mr.group(1), "a");
+        assertEquals(mr.start(1), 2);
+        assertEquals(mr.end(1), 3);
+
+        // ... and across the interleaved searches of a replaceAll: the
+        // failed first alternative in the second search must not leak
+        // group 1 into the second match
+        String out = Pattern.compile("(?:(a))*z|(b)").matcher("aazb")
+                .replaceAll(res -> res.group() + ":" + res.group(1) + "/" + res.group(2));
+        assertEquals(out, "aaz:a/nullb:null/b");
+
+        // The fix is observable in match results, not only in reported
+        // groups: a backreference to a group whose capture was leaked by
+        // an undone repetition no longer matches, because a backreference
+        // to a group that did not participate in the match must fail.
+        // Stock matched "b" here, driven by the leaked group 2.
+        assertFalse(Pattern.compile("(?<mn>a(?!(b))){0,3}+\\2")
+                .matcher("ab").find());
+
+        // Residual, pre-existing behavior shared with the recursive Loop
+        // path and unchanged by this fix: captures made inside lookahead
+        // conditions by a repetition attempt that failed can persist
+        // (Pos/Neg never unwind their condition's captures), while the
+        // same captures are cleaned when the quantified group as a whole
+        // fails.  These cases pin the current behavior.
+        checkGroups("(?:(?=(a))b)*", "ab", "", "a");      // persists
+        checkGroups("(?:(?=(a)))*$", "aa", "", null);     // cleaned
+        checkGroups("(?:(?=(a))b)*c", "abc", "c", "a");   // persists
+        checkGroups("(?=(a))*$", "aa", "", "a");          // quantified assertion
+    }
+
+    private static void checkGroups(String p, String input,
+                                    String... expected) {
+        Matcher m = Pattern.compile(p).matcher(input);
+        assertTrue(m.find(), "find() failed for " + p);
+        assertEquals(m.groupCount(), expected.length - 1,
+                "group count for " + p);
+        for (int g = 0; g < expected.length; g++)
+            assertEquals(m.group(g), expected[g],
+                    "group " + g + " for " + p + " on " + input);
     }
 }
 

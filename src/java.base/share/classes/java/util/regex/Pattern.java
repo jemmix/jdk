@@ -3144,6 +3144,10 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
         Node tail;
         int save = flags0;
         int saveTCNCount = topClosureNodes.size();
+        // Index that the first capture group nested in this group's body
+        // will be assigned; used to compute the range of group positions
+        // that a GroupCurly for this group must save and restore.
+        int saveGroupCount = capturingGroupCount;
         root = null;
         int ch = next();
         if (ch == '?') {
@@ -3258,6 +3262,17 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
 
         if (node instanceof Ques ques) {
             if (ques.type == Qtype.POSSESSIVE) {
+                // A possessive Ques on a group whose body can set group
+                // positions must use a GroupCurly, which restores the
+                // positions if the quantified group fails as a whole
+                int nestedFirst = saveGroupCount + (capturingGroup ? 1 : 0);
+                if (capturingGroup || nestedFirst < capturingGroupCount) {
+                    GroupTail temp = (GroupTail) tail;
+                    root = new GroupCurly(head.next, 0, 1, Qtype.POSSESSIVE,
+                            temp.localIndex, temp.groupIndex,
+                            capturingGroup, nestedFirst, capturingGroupCount);
+                    return root;
+                }
                 root = node;
                 return node;
             }
@@ -3272,6 +3287,19 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
             return head;
         } else if (node instanceof Curly curly) {
             if (curly.type == Qtype.POSSESSIVE) {
+                // A possessive Curly on a group recurses through the group
+                // nodes, which do not restore the group positions when the
+                // quantified group fails as a whole; use a GroupCurly
+                // instead, which does restore them
+                int nestedFirst = saveGroupCount + (capturingGroup ? 1 : 0);
+                if (capturingGroup || nestedFirst < capturingGroupCount) {
+                    GroupTail temp = (GroupTail) tail;
+                    root = new GroupCurly(head.next, curly.cmin, curly.cmax,
+                            Qtype.POSSESSIVE,
+                            temp.localIndex, temp.groupIndex,
+                            capturingGroup, nestedFirst, capturingGroupCount);
+                    return root;
+                }
                 root = node;
                 return node;
             }
@@ -3283,7 +3311,9 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
                         curly.cmax, curly.type,
                         temp.localIndex,
                         temp.groupIndex,
-                        capturingGroup);
+                        capturingGroup,
+                        saveGroupCount + (capturingGroup ? 1 : 0),
+                        capturingGroupCount);
                 return head;
             } else { // Non-deterministic
                 int temp = ((GroupHead) head).localIndex;
@@ -4674,9 +4704,15 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
         int localIndex;
         int groupIndex;
         boolean capture;
+        // Range, in the groups array, of the positions of the capture
+        // groups nested in the atom; empty if the atom has no nested
+        // capture groups.
+        int nestedFirst;
+        int nestedCount;
 
         GroupCurly(Node node, int cmin, int cmax, Qtype type, int local,
-                   int group, boolean capture) {
+                   int group, boolean capture,
+                   int nestedFirstGroup, int nestedLastGroup) {
             this.atom = node;
             this.type = type;
             this.cmin = cmin;
@@ -4684,6 +4720,8 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
             this.localIndex = local;
             this.groupIndex = group;
             this.capture = capture;
+            this.nestedFirst = nestedFirstGroup * 2;
+            this.nestedCount = (nestedLastGroup - nestedFirstGroup) * 2;
         }
         boolean match(Matcher matcher, int i, CharSequence seq) {
             int[] groups = matcher.groups;
@@ -4700,6 +4738,16 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
             // Notify GroupTail there is no need to setup group info
             // because it will be set here
             locals[localIndex] = -1;
+
+            // Base on the group positions stack for this invocation; all
+            // the positions saved by the repetitions below are dropped, or
+            // restored, before returning.  A single save suffices here:
+            // only the positions before the first repetition was attempted
+            // are ever restored below, so the repetitions of the cmin loop
+            // must not save anything per repetition.
+            int undoBase = matcher.groupPosTop;
+            if (nestedCount > 0 && cmin > 0)
+                matcher.saveGroupPos(nestedFirst, nestedCount);
 
             boolean ret = true;
             for (int j = 0; j < cmin; j++) {
@@ -4729,6 +4777,15 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
                     groups[groupIndex] = save1;
                     groups[groupIndex+1] = save2;
                 }
+                // Leave the nested group positions as they were before the
+                // first repetition was attempted
+                if (nestedCount > 0)
+                    matcher.restoreGroupPosBase(undoBase,
+                            nestedFirst, nestedCount);
+            } else {
+                // The match succeeds with the current nested group
+                // positions; only the saved positions are dropped
+                matcher.groupPosTop = undoBase;
             }
             return ret;
         }
@@ -4743,11 +4800,19 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
                 save0 = groups[groupIndex];
                 save1 = groups[groupIndex+1];
             }
+            int undoBase = matcher.groupPosTop;
             for (;;) {
                 if (j >= cmax)
                     break;
-                if (!atom.match(matcher, i, seq))
+                if (nestedCount > 0)
+                    matcher.saveGroupPos(nestedFirst, nestedCount);
+                if (!atom.match(matcher, i, seq)) {
+                    // The unwinding of the nodes inside the atom has
+                    // restored the nested group positions
+                    if (nestedCount > 0)
+                        matcher.dropGroupPos(nestedCount);
                     break;
+                }
                 int k = matcher.last - i;
                 if (k <= 0) {
                     if (capture) {
@@ -4765,20 +4830,32 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
                     i = i + k;
                     if (++j >= cmax)
                         break;
-                    if (!atom.match(matcher, i, seq))
+                    if (nestedCount > 0)
+                        matcher.saveGroupPos(nestedFirst, nestedCount);
+                    if (!atom.match(matcher, i, seq)) {
+                        // The unwinding of the nodes inside the atom has
+                        // restored the nested group positions
+                        if (nestedCount > 0)
+                            matcher.dropGroupPos(nestedCount);
                         break;
+                    }
                     if (i + k != matcher.last) {
-                        if (match0(matcher, i, j, seq))
+                        if (match0(matcher, i, j, seq)) {
+                            matcher.groupPosTop = undoBase;
                             return true;
+                        }
                         break;
                     }
                 }
                 while (j > min) {
                     if (next.match(matcher, i, seq)) {
-                        if (capture) {
-                            groups[groupIndex+1] = i;
-                            groups[groupIndex] = i - k;
-                        }
+                        // The group positions are already those of the
+                        // last repetition matched; they must not be
+                        // rewritten here: the continuation may have run
+                        // more repetitions of this same group through an
+                        // enclosing quantifier, and the positions of those
+                        // repetitions are the correct result.
+                        matcher.groupPosTop = undoBase;
                         return true;
                     }
                     // backing off
@@ -4788,7 +4865,10 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
                         groups[groupIndex] = i - k;
                     }
                     j--;
-
+                    // Restore the nested group positions of the
+                    // repetition just undone
+                    if (nestedCount > 0)
+                        matcher.restoreGroupPos(nestedFirst, nestedCount);
                 }
                 break;
             }
@@ -4796,19 +4876,38 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
                 groups[groupIndex] = save0;
                 groups[groupIndex+1] = save1;
             }
+            // Try the continuation with the repetitions made so far; if it
+            // fails, leave the nested group positions as they were before
+            // the first repetition was attempted here
+            if (nestedCount > 0) {
+                if (next.match(matcher, i, seq)) {
+                    matcher.groupPosTop = undoBase;
+                    return true;
+                }
+                matcher.restoreGroupPosBase(undoBase,
+                        nestedFirst, nestedCount);
+                return false;
+            }
             return next.match(matcher, i, seq);
         }
         // Reluctant matching
         boolean match1(Matcher matcher, int i, int j, CharSequence seq) {
+            // A single save suffices: only the positions before the first
+            // repetition attempted here are ever restored below
+            int undoBase = matcher.groupPosTop;
+            if (nestedCount > 0 && j < cmax)
+                matcher.saveGroupPos(nestedFirst, nestedCount);
             for (;;) {
-                if (next.match(matcher, i, seq))
+                if (next.match(matcher, i, seq)) {
+                    matcher.groupPosTop = undoBase;
                     return true;
+                }
                 if (j >= cmax)
-                    return false;
+                    break;
                 if (!atom.match(matcher, i, seq))
-                    return false;
+                    break;
                 if (i == matcher.last)
-                    return false;
+                    break;
                 if (capture) {
                     matcher.groups[groupIndex] = i;
                     matcher.groups[groupIndex+1] = matcher.last;
@@ -4816,9 +4915,19 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
                 i = matcher.last;
                 j++;
             }
+            // Leave the nested group positions as they were before the
+            // first repetition attempted here was attempted
+            if (nestedCount > 0)
+                matcher.restoreGroupPosBase(undoBase, nestedFirst, nestedCount);
+            return false;
         }
         // Possessive matching
         boolean match2(Matcher matcher, int i, int j, CharSequence seq) {
+            // A single save suffices: only the positions before the first
+            // repetition attempted here are ever restored below
+            int undoBase = matcher.groupPosTop;
+            if (nestedCount > 0 && j < cmax)
+                matcher.saveGroupPos(nestedFirst, nestedCount);
             for (; j < cmax; j++) {
                 if (!atom.match(matcher, i, seq)) {
                     break;
@@ -4832,7 +4941,15 @@ loop:   for(int x=0, offset=0; x<nCodePoints; x++, offset+=len) {
                 }
                 i = matcher.last;
             }
-            return next.match(matcher, i, seq);
+            if (next.match(matcher, i, seq)) {
+                matcher.groupPosTop = undoBase;
+                return true;
+            }
+            // Leave the nested group positions as they were before the
+            // first repetition attempted here was attempted
+            if (nestedCount > 0)
+                matcher.restoreGroupPosBase(undoBase, nestedFirst, nestedCount);
+            return false;
         }
         boolean study(TreeInfo info) {
             // Save original info
